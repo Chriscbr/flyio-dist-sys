@@ -11,10 +11,7 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type outmsg struct {
-	ackID int
-	body  map[string]any
-}
+var gossipBatchTimeout = 300 * time.Millisecond
 
 type syncIntSlice struct {
 	mu   sync.Mutex
@@ -49,65 +46,87 @@ type Gossiper struct {
 	n            *maelstrom.Node
 	nextAckID    int
 	mu           sync.Mutex
-	outbox       map[string]chan outmsg
+	outbox       map[string]chan int
 	awaitingAcks map[string]*syncIntSlice
 }
 
 func NewGossiper(n *maelstrom.Node) *Gossiper {
-	outbox := make(map[string]chan outmsg)
+	outbox := make(map[string]chan int)
 	awaitingAcks := make(map[string]*syncIntSlice)
 	nextAckID := 1
 	return &Gossiper{n, nextAckID, sync.Mutex{}, outbox, awaitingAcks}
 }
 
-func (g *Gossiper) startGossipWithDest(dest string) {
+func (g *Gossiper) Gossip(dest string, val int) {
 	g.mu.Lock()
-	outbox := g.outbox[dest]
-	awaitingAcks := g.awaitingAcks[dest]
-	g.mu.Unlock()
-
-	for o := range outbox {
-		if !awaitingAcks.Contains(o.ackID) {
-			// this message has already been acked, do not re-send
-			continue
-		}
-
-		err := g.n.Send(dest, o.body)
-		if err != nil {
-			log.Printf("Error: %v", err)
-		}
-		go func() {
-			time.Sleep(1 * time.Second)
-			outbox <- o
-		}()
-	}
-}
-
-func (g *Gossiper) Gossip(dest string, message any) {
 	_, ok := g.outbox[dest]
 	if !ok {
-		g.mu.Lock()
-		g.outbox[dest] = make(chan outmsg)
+		g.outbox[dest] = make(chan int)
 		g.awaitingAcks[dest] = newSyncIntSlice()
-		g.mu.Unlock()
 		go g.startGossipWithDest(dest)
 	}
 
-	ackID := g.nextAckID
-	body := make(map[string]any)
-	body["type"] = "gossip"
-	body["message"] = message
-	body["ack_id"] = ackID
-
-	g.mu.Lock()
-	awaitingAcks := g.awaitingAcks[dest]
 	outbox := g.outbox[dest]
 	g.mu.Unlock()
 
-	awaitingAcks.Append(ackID)
-	outbox <- outmsg{ackID, body}
+	outbox <- val
+}
 
+func (g *Gossiper) startGossipWithDest(dest string) {
+	g.mu.Lock()
+	outbox := g.outbox[dest]
+	g.mu.Unlock()
+
+	timer := time.NewTimer(gossipBatchTimeout)
+	buf := make([]int, 0)
+	for {
+		select {
+		case v, ok := <-outbox:
+			if !ok {
+				if len(buf) > 0 {
+					go g.sendBatch(dest, buf)
+				}
+				close(outbox)
+				return
+			}
+			buf = append(buf, v)
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(gossipBatchTimeout)
+		case <-timer.C:
+			if len(buf) > 0 {
+				go g.sendBatch(dest, buf)
+			}
+			buf = nil
+			timer.Reset(gossipBatchTimeout)
+		}
+	}
+}
+
+func (g *Gossiper) sendBatch(dest string, vals []int) {
+	g.mu.Lock()
+	awaitingAcks := g.awaitingAcks[dest]
+	awaitingAcks.Append(g.nextAckID)
+	ackID := g.nextAckID
+	body := make(map[string]any)
+	body["type"] = "gossip"
+	body["messages"] = vals
+	body["ack_id"] = ackID
 	g.nextAckID++
+	g.mu.Unlock()
+	for {
+		if !awaitingAcks.Contains(ackID) {
+			// this message has already been acked, do not re-send
+			return
+		}
+		err := g.n.Send(dest, body)
+		if err != nil {
+			log.Printf("Error: %v", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
 }
 
 func (g *Gossiper) Ack(dest string, ackID int) {
@@ -145,7 +164,7 @@ func main() {
 				if n2 == n.ID() {
 					continue
 				}
-				g.Gossip(n2, val)
+				g.Gossip(n2, int(val))
 			}
 		}
 
@@ -158,9 +177,9 @@ func main() {
 			return err
 		}
 
-		val, ok := body["message"].(float64)
+		vals, ok := body["messages"].([]any)
 		if !ok {
-			return errors.New("non-number message received in gossip")
+			return errors.New("non-array messages received in gossip")
 		}
 		ackID, ok := body["ack_id"].(float64)
 		if !ok {
@@ -170,8 +189,10 @@ func main() {
 		mu.Lock()
 		defer mu.Unlock()
 
-		if !slices.Contains(messages, int(val)) {
-			messages = append(messages, int(val))
+		for _, val := range vals {
+			if !slices.Contains(messages, int(val.(float64))) {
+				messages = append(messages, int(val.(float64)))
+			}
 		}
 
 		return n.Send(msg.Src, map[string]any{"type": "gossip_ok", "ack_id": ackID})
