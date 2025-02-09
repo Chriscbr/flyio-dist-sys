@@ -13,33 +13,32 @@ import (
 
 var gossipBatchTimeout = 300 * time.Millisecond
 
-type syncIntSlice struct {
+type syncIntSet struct {
 	mu   sync.Mutex
-	vals []int
+	vals map[int]struct{}
 }
 
-func newSyncIntSlice() *syncIntSlice {
-	return &syncIntSlice{mu: sync.Mutex{}, vals: make([]int, 0)}
+func newSyncIntSet() *syncIntSet {
+	return &syncIntSet{mu: sync.Mutex{}, vals: make(map[int]struct{})}
 }
 
-func (s *syncIntSlice) Append(x int) {
+func (s *syncIntSet) Append(x int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.vals = append(s.vals, x)
+	s.vals[x] = struct{}{}
 }
 
-func (s *syncIntSlice) Contains(x int) bool {
+func (s *syncIntSet) Contains(x int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return slices.Contains(s.vals, x)
+	_, ok := s.vals[x]
+	return ok
 }
 
-func (s *syncIntSlice) Remove(x int) {
+func (s *syncIntSet) Remove(x int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_ = slices.DeleteFunc(s.vals, func(x2 int) bool {
-		return x2 == x
-	})
+	delete(s.vals, x)
 }
 
 type Gossiper struct {
@@ -47,12 +46,12 @@ type Gossiper struct {
 	nextAckID    int
 	mu           sync.Mutex
 	outbox       map[string]chan int
-	awaitingAcks map[string]*syncIntSlice
+	awaitingAcks map[string]*syncIntSet
 }
 
 func NewGossiper(n *maelstrom.Node) *Gossiper {
 	outbox := make(map[string]chan int)
-	awaitingAcks := make(map[string]*syncIntSlice)
+	awaitingAcks := make(map[string]*syncIntSet)
 	nextAckID := 1
 	return &Gossiper{n, nextAckID, sync.Mutex{}, outbox, awaitingAcks}
 }
@@ -62,7 +61,7 @@ func (g *Gossiper) Gossip(dest string, val int) {
 	_, ok := g.outbox[dest]
 	if !ok {
 		g.outbox[dest] = make(chan int)
-		g.awaitingAcks[dest] = newSyncIntSlice()
+		g.awaitingAcks[dest] = newSyncIntSet()
 		go g.startGossipWithDest(dest)
 	}
 
