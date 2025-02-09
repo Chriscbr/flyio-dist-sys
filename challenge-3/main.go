@@ -11,7 +11,8 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-var gossipBatchTimeout = 300 * time.Millisecond
+// how often to send out batches of gossip
+var gossipBatchRate = 1 * time.Second
 
 type syncIntSet struct {
 	mu   sync.Mutex
@@ -76,7 +77,7 @@ func (g *Gossiper) startGossipWithDest(dest string) {
 	outbox := g.outbox[dest]
 	g.mu.Unlock()
 
-	timer := time.NewTimer(gossipBatchTimeout)
+	ticker := time.NewTicker(gossipBatchRate)
 	buf := make([]int, 0)
 	for {
 		select {
@@ -86,19 +87,15 @@ func (g *Gossiper) startGossipWithDest(dest string) {
 					go g.sendBatch(dest, buf)
 				}
 				close(outbox)
+				ticker.Stop()
 				return
 			}
 			buf = append(buf, v)
-			if !timer.Stop() {
-				<-timer.C
-			}
-			timer.Reset(gossipBatchTimeout)
-		case <-timer.C:
+		case <-ticker.C:
 			if len(buf) > 0 {
 				go g.sendBatch(dest, buf)
 			}
 			buf = nil
-			timer.Reset(gossipBatchTimeout)
 		}
 	}
 }
