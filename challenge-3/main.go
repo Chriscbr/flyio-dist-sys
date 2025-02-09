@@ -12,58 +12,60 @@ import (
 )
 
 type outmsg struct {
-	dest    string
-	ackID   int
-	message map[string]any
-	acktype string
+	dest  string
+	ackID int
+	body  map[string]any
 }
 
-type MessageSender struct {
+type Gossiper struct {
 	n            *maelstrom.Node
 	nextAckID    int
 	outbox       chan outmsg
 	awaitingAcks []int
 }
 
-func NewMessageSender(n *maelstrom.Node) *MessageSender {
+func NewGossiper(n *maelstrom.Node) *Gossiper {
 	outbox := make(chan outmsg)
 	awaitingAcks := make([]int, 0)
 	nextAckID := 1
-	return &MessageSender{n, nextAckID, outbox, awaitingAcks}
+	return &Gossiper{n, nextAckID, outbox, awaitingAcks}
 }
 
-func (m *MessageSender) Start() {
-	go m.sendMessages()
+func (g *Gossiper) Start() {
+	go g.sendMessages()
 }
 
-func (m *MessageSender) SendWithRetries(dest string, message map[string]any, acktype string) {
-	ackID := m.nextAckID
-	message["ack_id"] = ackID
-	m.awaitingAcks = append(m.awaitingAcks, ackID)
-	m.outbox <- outmsg{dest, ackID, message, acktype}
-	m.nextAckID++
+func (g *Gossiper) Gossip(dest string, message any) {
+	ackID := g.nextAckID
+	body := make(map[string]any)
+	body["type"] = "gossip"
+	body["message"] = message
+	body["ack_id"] = ackID
+	g.awaitingAcks = append(g.awaitingAcks, ackID)
+	g.outbox <- outmsg{dest, ackID, body}
+	g.nextAckID++
 }
 
-func (m *MessageSender) Ack(typ string, ackID int) {
+func (g *Gossiper) Ack(ackID int) {
 	// remove ackID from awaitingAcks
-	_ = slices.DeleteFunc(m.awaitingAcks, func(ackID2 int) bool {
+	_ = slices.DeleteFunc(g.awaitingAcks, func(ackID2 int) bool {
 		return ackID2 == ackID
 	})
 }
 
-func (m *MessageSender) sendMessages() {
-	for o := range m.outbox {
-		if !slices.Contains(m.awaitingAcks, o.ackID) {
+func (g *Gossiper) sendMessages() {
+	for o := range g.outbox {
+		if !slices.Contains(g.awaitingAcks, o.ackID) {
 			// this message has already been acked, do not re-send
 			continue
 		}
-		err := m.n.Send(o.dest, o.message)
+		err := g.n.Send(o.dest, o.body)
 		if err != nil {
 			log.Printf("Error: %v", err)
 		}
 		go func() {
 			time.Sleep(1 * time.Second)
-			m.outbox <- o
+			g.outbox <- o
 		}()
 	}
 }
@@ -74,8 +76,8 @@ func main() {
 	mu := sync.Mutex{}  // guards `messages`
 	messages := []int{} // all messages received to date
 
-	m := NewMessageSender(n)
-	m.Start()
+	g := NewGossiper(n)
+	g.Start()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
@@ -97,8 +99,7 @@ func main() {
 				if n2 == n.ID() {
 					continue
 				}
-				message := map[string]any{"type": "gossip", "message": val}
-				m.SendWithRetries(n2, message, "gossip_ok")
+				g.Gossip(n2, val)
 			}
 		}
 
@@ -141,7 +142,7 @@ func main() {
 			return errors.New("missing ack_id in gossip_ok")
 		}
 
-		m.Ack("gossip_ok", int(ackID))
+		g.Ack(int(ackID))
 		return nil
 	})
 
