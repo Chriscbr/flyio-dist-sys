@@ -12,62 +12,109 @@ import (
 )
 
 type outmsg struct {
-	dest  string
 	ackID int
 	body  map[string]any
+}
+
+type syncIntSlice struct {
+	mu   sync.Mutex
+	vals []int
+}
+
+func newSyncIntSlice() *syncIntSlice {
+	return &syncIntSlice{mu: sync.Mutex{}, vals: make([]int, 0)}
+}
+
+func (s *syncIntSlice) Append(x int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vals = append(s.vals, x)
+}
+
+func (s *syncIntSlice) Contains(x int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.vals, x)
+}
+
+func (s *syncIntSlice) Remove(x int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = slices.DeleteFunc(s.vals, func(x2 int) bool {
+		return x2 == x
+	})
 }
 
 type Gossiper struct {
 	n            *maelstrom.Node
 	nextAckID    int
-	outbox       chan outmsg
-	awaitingAcks []int
+	mu           sync.Mutex
+	outbox       map[string]chan outmsg
+	awaitingAcks map[string]*syncIntSlice
 }
 
 func NewGossiper(n *maelstrom.Node) *Gossiper {
-	outbox := make(chan outmsg)
-	awaitingAcks := make([]int, 0)
+	outbox := make(map[string]chan outmsg)
+	awaitingAcks := make(map[string]*syncIntSlice)
 	nextAckID := 1
-	return &Gossiper{n, nextAckID, outbox, awaitingAcks}
+	return &Gossiper{n, nextAckID, sync.Mutex{}, outbox, awaitingAcks}
 }
 
-func (g *Gossiper) Start() {
-	go g.sendMessages()
-}
+func (g *Gossiper) startGossipWithDest(dest string) {
+	g.mu.Lock()
+	outbox := g.outbox[dest]
+	awaitingAcks := g.awaitingAcks[dest]
+	g.mu.Unlock()
 
-func (g *Gossiper) Gossip(dest string, message any) {
-	ackID := g.nextAckID
-	body := make(map[string]any)
-	body["type"] = "gossip"
-	body["message"] = message
-	body["ack_id"] = ackID
-	g.awaitingAcks = append(g.awaitingAcks, ackID)
-	g.outbox <- outmsg{dest, ackID, body}
-	g.nextAckID++
-}
-
-func (g *Gossiper) Ack(ackID int) {
-	// remove ackID from awaitingAcks
-	_ = slices.DeleteFunc(g.awaitingAcks, func(ackID2 int) bool {
-		return ackID2 == ackID
-	})
-}
-
-func (g *Gossiper) sendMessages() {
-	for o := range g.outbox {
-		if !slices.Contains(g.awaitingAcks, o.ackID) {
+	for o := range outbox {
+		if !awaitingAcks.Contains(o.ackID) {
 			// this message has already been acked, do not re-send
 			continue
 		}
-		err := g.n.Send(o.dest, o.body)
+
+		err := g.n.Send(dest, o.body)
 		if err != nil {
 			log.Printf("Error: %v", err)
 		}
 		go func() {
 			time.Sleep(1 * time.Second)
-			g.outbox <- o
+			outbox <- o
 		}()
 	}
+}
+
+func (g *Gossiper) Gossip(dest string, message any) {
+	_, ok := g.outbox[dest]
+	if !ok {
+		g.mu.Lock()
+		g.outbox[dest] = make(chan outmsg)
+		g.awaitingAcks[dest] = newSyncIntSlice()
+		g.mu.Unlock()
+		go g.startGossipWithDest(dest)
+	}
+
+	ackID := g.nextAckID
+	body := make(map[string]any)
+	body["type"] = "gossip"
+	body["message"] = message
+	body["ack_id"] = ackID
+
+	g.mu.Lock()
+	awaitingAcks := g.awaitingAcks[dest]
+	outbox := g.outbox[dest]
+	g.mu.Unlock()
+
+	awaitingAcks.Append(ackID)
+	outbox <- outmsg{ackID, body}
+
+	g.nextAckID++
+}
+
+func (g *Gossiper) Ack(dest string, ackID int) {
+	// remove ackID from awaitingAcks
+	g.mu.Lock()
+	g.awaitingAcks[dest].Remove(ackID)
+	g.mu.Unlock()
 }
 
 func main() {
@@ -77,7 +124,6 @@ func main() {
 	messages := []int{} // all messages received to date
 
 	g := NewGossiper(n)
-	g.Start()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body map[string]any
@@ -142,7 +188,7 @@ func main() {
 			return errors.New("missing ack_id in gossip_ok")
 		}
 
-		g.Ack(int(ackID))
+		g.Ack(msg.Src, int(ackID))
 		return nil
 	})
 
