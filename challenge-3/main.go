@@ -49,12 +49,12 @@ type Gossiper struct {
 	n            *maelstrom.Node
 	nextAckID    int
 	mu           sync.Mutex
-	outbox       map[string]chan int
+	outbox       map[string][]int
 	awaitingAcks map[string]*syncIntSet
 }
 
 func NewGossiper(n *maelstrom.Node) *Gossiper {
-	outbox := make(map[string]chan int)
+	outbox := make(map[string][]int)
 	awaitingAcks := make(map[string]*syncIntSet)
 	nextAckID := 1
 	return &Gossiper{n, nextAckID, sync.Mutex{}, outbox, awaitingAcks}
@@ -64,41 +64,23 @@ func (g *Gossiper) Gossip(dest string, val int) {
 	g.mu.Lock()
 	_, ok := g.outbox[dest]
 	if !ok {
-		g.outbox[dest] = make(chan int)
+		g.outbox[dest] = []int{}
 		g.awaitingAcks[dest] = newSyncIntSet()
 		go g.startGossipWithDest(dest)
 	}
-
-	outbox := g.outbox[dest]
+	g.outbox[dest] = append(g.outbox[dest], val)
 	g.mu.Unlock()
-
-	outbox <- val
 }
 
 func (g *Gossiper) startGossipWithDest(dest string) {
-	g.mu.Lock()
-	outbox := g.outbox[dest]
-	g.mu.Unlock()
-
 	ticker := time.NewTicker(gossipBatchRate)
-	buf := make([]int, 0)
-	for {
-		select {
-		case v, ok := <-outbox:
-			if !ok {
-				if len(buf) > 0 {
-					go g.sendBatch(dest, buf)
-				}
-				close(outbox)
-				ticker.Stop()
-				return
-			}
-			buf = append(buf, v)
-		case <-ticker.C:
-			if len(buf) > 0 {
-				go g.sendBatch(dest, buf)
-			}
-			buf = nil
+	for range ticker.C {
+		g.mu.Lock()
+		outbox := g.outbox[dest]
+		g.outbox[dest] = []int{}
+		g.mu.Unlock()
+		if len(outbox) > 0 {
+			go g.sendBatch(dest, outbox)
 		}
 	}
 }
@@ -125,7 +107,6 @@ func (g *Gossiper) sendBatch(dest string, vals []int) {
 		}
 		time.Sleep(gossipResendRate)
 	}
-
 }
 
 func (g *Gossiper) Ack(dest string, ackID int) {
