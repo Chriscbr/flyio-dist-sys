@@ -14,50 +14,17 @@ import (
 // how often to send out batches of gossip
 var gossipBatchRate = 1 * time.Second
 
-// how often to resend unacknowledged messages
-var gossipResendRate = 1 * time.Second
-
-type syncIntSet struct {
-	mu   sync.Mutex
-	vals map[int]struct{}
-}
-
-func newSyncIntSet() *syncIntSet {
-	return &syncIntSet{mu: sync.Mutex{}, vals: make(map[int]struct{})}
-}
-
-func (s *syncIntSet) Append(x int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.vals[x] = struct{}{}
-}
-
-func (s *syncIntSet) Contains(x int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, ok := s.vals[x]
-	return ok
-}
-
-func (s *syncIntSet) Remove(x int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.vals, x)
-}
-
 type Gossiper struct {
-	n            *maelstrom.Node
-	nextAckID    int
-	mu           sync.Mutex
-	outbox       map[string][]int
-	awaitingAcks map[string]*syncIntSet
+	n         *maelstrom.Node
+	mu        sync.Mutex
+	outbox    map[string][]int
+	ackedVals map[string][]int
 }
 
 func NewGossiper(n *maelstrom.Node) *Gossiper {
 	outbox := make(map[string][]int)
-	awaitingAcks := make(map[string]*syncIntSet)
-	nextAckID := 1
-	return &Gossiper{n, nextAckID, sync.Mutex{}, outbox, awaitingAcks}
+	ackedVals := make(map[string][]int)
+	return &Gossiper{n, sync.Mutex{}, outbox, ackedVals}
 }
 
 func (g *Gossiper) Gossip(dest string, val int) {
@@ -65,7 +32,7 @@ func (g *Gossiper) Gossip(dest string, val int) {
 	_, ok := g.outbox[dest]
 	if !ok {
 		g.outbox[dest] = []int{}
-		g.awaitingAcks[dest] = newSyncIntSet()
+		g.ackedVals[dest] = []int{}
 		go g.startGossipWithDest(dest)
 	}
 	g.outbox[dest] = append(g.outbox[dest], val)
@@ -76,43 +43,29 @@ func (g *Gossiper) startGossipWithDest(dest string) {
 	ticker := time.NewTicker(gossipBatchRate)
 	for range ticker.C {
 		g.mu.Lock()
-		outbox := g.outbox[dest]
-		g.outbox[dest] = []int{}
+		unackedVals := make([]int, 0)
+		for _, val := range g.outbox[dest] {
+			if !slices.Contains(g.ackedVals[dest], val) {
+				unackedVals = append(unackedVals, val)
+			}
+		}
+		g.outbox[dest] = unackedVals
+		if len(unackedVals) > 0 {
+			body := make(map[string]any)
+			body["type"] = "gossip"
+			body["messages"] = unackedVals
+			err := g.n.Send(dest, body)
+			if err != nil {
+				log.Printf("Error: %v", err)
+			}
+		}
 		g.mu.Unlock()
-		if len(outbox) > 0 {
-			go g.sendBatch(dest, outbox)
-		}
 	}
 }
 
-func (g *Gossiper) sendBatch(dest string, vals []int) {
+func (g *Gossiper) Ack(dest string, vals ...int) {
 	g.mu.Lock()
-	awaitingAcks := g.awaitingAcks[dest]
-	awaitingAcks.Append(g.nextAckID)
-	ackID := g.nextAckID
-	body := make(map[string]any)
-	body["type"] = "gossip"
-	body["messages"] = vals
-	body["ack_id"] = ackID
-	g.nextAckID++
-	g.mu.Unlock()
-	for {
-		if !awaitingAcks.Contains(ackID) {
-			// this message has already been acked, do not re-send
-			return
-		}
-		err := g.n.Send(dest, body)
-		if err != nil {
-			log.Printf("Error: %v", err)
-		}
-		time.Sleep(gossipResendRate)
-	}
-}
-
-func (g *Gossiper) Ack(dest string, ackID int) {
-	// remove ackID from awaitingAcks
-	g.mu.Lock()
-	g.awaitingAcks[dest].Remove(ackID)
+	g.ackedVals[dest] = append(g.ackedVals[dest], vals...)
 	g.mu.Unlock()
 }
 
@@ -161,10 +114,6 @@ func main() {
 		if !ok {
 			return errors.New("non-array messages received in gossip")
 		}
-		ackID, ok := body["ack_id"].(float64)
-		if !ok {
-			return errors.New("missing ack_id in gossip")
-		}
 
 		mu.Lock()
 		defer mu.Unlock()
@@ -175,7 +124,7 @@ func main() {
 			}
 		}
 
-		return n.Send(msg.Src, map[string]any{"type": "gossip_ok", "ack_id": ackID})
+		return n.Send(msg.Src, map[string]any{"type": "gossip_ok", "messages": vals})
 	})
 
 	n.Handle("gossip_ok", func(msg maelstrom.Message) error {
@@ -184,12 +133,16 @@ func main() {
 			return err
 		}
 
-		ackID, ok := body["ack_id"].(float64)
+		vals, ok := body["messages"].([]any)
 		if !ok {
-			return errors.New("missing ack_id in gossip_ok")
+			return errors.New("non-array messages received in gossip_ok")
 		}
 
-		g.Ack(msg.Src, int(ackID))
+		valsInt := make([]int, 0)
+		for _, val := range vals {
+			valsInt = append(valsInt, int(val.(float64)))
+		}
+		g.Ack(msg.Src, valsInt...)
 		return nil
 	})
 
