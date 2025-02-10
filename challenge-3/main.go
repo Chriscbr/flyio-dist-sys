@@ -14,6 +14,9 @@ import (
 // how often to send out batches of gossip
 var gossipBatchRate = 1 * time.Second
 
+// how often to resend unacknowledged messages
+var gossipResendRate = 1 * time.Second
+
 type syncIntSet struct {
 	mu   sync.Mutex
 	vals map[int]struct{}
@@ -120,7 +123,7 @@ func (g *Gossiper) sendBatch(dest string, vals []int) {
 		if err != nil {
 			log.Printf("Error: %v", err)
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(gossipResendRate)
 	}
 
 }
