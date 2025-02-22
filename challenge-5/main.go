@@ -88,7 +88,7 @@ func (s *Store) getLog(ctx context.Context, key string) ([]int, error) {
 		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
 			return make([]int, 0), nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("kv error: %w", err)
 	}
 	return data, nil
 }
@@ -128,7 +128,7 @@ func (s *Store) SetCommitOffset(ctx context.Context, key string, offset int) err
 		if err != nil {
 			rpcErr, ok := err.(*maelstrom.RPCError)
 			if !ok || rpcErr.Code != maelstrom.KeyDoesNotExist {
-				return err
+				return fmt.Errorf("kv error: %w", err)
 			}
 			currOffset = 0
 		}
@@ -189,7 +189,7 @@ func (s *Store) GetCommitOffset(ctx context.Context, key string) (int, error) {
 		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
 			return 0, nil
 		}
-		return 0, err
+		return 0, fmt.Errorf("kv error: %w", err)
 	}
 	return offset, err
 }
