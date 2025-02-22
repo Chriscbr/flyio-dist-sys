@@ -44,17 +44,39 @@ func (s *Store) AddMessage(ctx context.Context, key string, msg int) (int, error
 // Poll returns the messages for a given set of offsets.
 // Returns a map from keys to arrays of [offset, message] pairs.
 func (s *Store) Poll(ctx context.Context, offsets map[string]int) (map[string][][2]int, error) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	res := make(map[string][][2]int)
+	errCh := make(chan error, len(offsets))
+
 	for key, offset := range offsets {
-		data, err := s.getLog(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		res[key] = make([][2]int, 0)
-		for idx, msg := range data[offset:] {
-			res[key] = append(res[key], [2]int{offset + idx, msg})
-		}
+		wg.Add(1)
+		go func(key string, offset int) {
+			defer wg.Done()
+			data, err := s.getLog(ctx, key)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			messages := make([][2]int, 0, len(data[offset:]))
+			for idx, msg := range data[offset:] {
+				messages = append(messages, [2]int{offset + idx, msg})
+			}
+
+			mu.Lock()
+			res[key] = messages
+			mu.Unlock()
+		}(key, offset)
 	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		return nil, err // return first error encountered
+	}
+
 	return res, nil
 }
 
