@@ -1,90 +1,150 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
-	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type Store struct {
-	mu      sync.Mutex
-	offsets map[string]int
-	logs    map[string][]int
+	kv *maelstrom.KV
 }
 
-func NewStore() *Store {
-	return &Store{
-		offsets: make(map[string]int),
-		logs:    make(map[string][]int),
-	}
+func NewStore(kv *maelstrom.KV) *Store {
+	return &Store{kv}
 }
 
+// AddMessage appends a message to the log for a given key and returns the offset of the message.
 func (s *Store) AddMessage(key string, msg int) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	ctx := context.Background()
+	kvkey := fmt.Sprintf("log/%s", key)
+	for {
+		currData, err := s.getLog(key)
+		if err != nil {
+			return 0, err
+		}
 
-	log, ok := s.logs[key]
-	if !ok {
-		s.logs[key] = make([]int, 0)
-		log = s.logs[key]
+		// compare-and-swap to update the KV store
+		newData := append(currData, msg)
+		if err := s.kv.CompareAndSwap(ctx, kvkey, currData, newData, true); err != nil {
+			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
+				// if the CAS fails, retry
+				continue
+			}
+			return 0, fmt.Errorf("kv error: %w", err)
+		}
+		return len(newData) - 1, nil
 	}
-
-	log = append(log, msg)
-	s.logs[key] = log
-	return len(log) - 1, nil
 }
 
-func (s *Store) Poll(offsets map[string]int) (map[string][][]int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	res := make(map[string][][]int)
+// Poll returns the messages for a given set of offsets.
+// Returns a map from keys to arrays of [offset, message] pairs.
+func (s *Store) Poll(offsets map[string]int) (map[string][][2]int, error) {
+	res := make(map[string][][2]int)
 	for key, offset := range offsets {
-		log, ok := s.logs[key]
-		if !ok {
-			log = make([]int, 0)
-			s.logs[key] = log
+		data, err := s.getLog(key)
+		if err != nil {
+			return nil, err
 		}
-		res[key] = make([][]int, 0)
-		for idx, msg := range log[offset:] {
-			res[key] = append(res[key], []int{offset + idx, msg})
+		res[key] = make([][2]int, 0)
+		for idx, msg := range data[offset:] {
+			res[key] = append(res[key], [2]int{offset + idx, msg})
 		}
 	}
 	return res, nil
 }
 
-func (s *Store) SetCommitOffsets(offsets map[string]int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// getLog returns all of the messages of a log with the given key.
+func (s *Store) getLog(key string) ([]int, error) {
+	ctx := context.Background()
+	kvkey := fmt.Sprintf("log/%s", key)
+	var data []int
+	if err := s.kv.ReadInto(ctx, kvkey, &data); err != nil {
+		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+			return make([]int, 0), nil
+		}
+		return nil, err
+	}
+	return data, nil
+}
 
+// SetCommitOffsets sets the commit offsets for a given set of keys.
+func (s *Store) SetCommitOffsets(offsets map[string]int) error {
 	for key, offset := range offsets {
-		s.offsets[key] = offset
+		if err := s.SetCommitOffset(key, offset); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func (s *Store) GetCommitOffsets(offsets []string) (map[string]int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// SetCommitOffset sets the commit offset for a given key.
+// Setting the offset for a key to a lower value than the current offset is a no-op.
+func (s *Store) SetCommitOffset(key string, offset int) error {
+	ctx := context.Background()
+	kvkey := fmt.Sprintf("offset/%s", key)
+	for {
+		// get the current offset
+		currOffset, err := s.kv.ReadInt(ctx, kvkey)
+		if err != nil {
+			rpcErr, ok := err.(*maelstrom.RPCError)
+			if !ok || rpcErr.Code != maelstrom.KeyDoesNotExist {
+				return err
+			}
+			currOffset = 0
+		}
 
+		// return if we've already processed messages up to this offset
+		if offset <= currOffset {
+			return nil
+		}
+
+		// compare-and-swap to update the KV store
+		if err := s.kv.CompareAndSwap(ctx, kvkey, currOffset, offset, true); err != nil {
+			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
+				// if the CAS fails, retry
+				continue
+			}
+			return fmt.Errorf("kv error: %w", err)
+		}
+		return nil
+	}
+}
+
+// GetCommitOffsets returns the commit offsets for a given set of keys.
+func (s *Store) GetCommitOffsets(keys []string) (map[string]int, error) {
 	res := make(map[string]int)
-	for _, key := range offsets {
-		offset, ok := s.offsets[key]
-		if !ok {
-			offset = 0
-			s.offsets[key] = offset
+	for _, key := range keys {
+		offset, err := s.GetCommitOffset(key)
+		if err != nil {
+			return nil, err
 		}
 		res[key] = offset
 	}
 	return res, nil
 }
 
+// GetCommitOffset returns the commit offset for a given key.
+func (s *Store) GetCommitOffset(key string) (int, error) {
+	ctx := context.Background()
+	offset, err := s.kv.ReadInt(ctx, fmt.Sprintf("offset/%s", key))
+	if err != nil {
+		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return offset, err
+}
+
 func main() {
 	n := maelstrom.NewNode()
-	s := NewStore()
+	kv := maelstrom.NewLinKV(n)
+	s := NewStore(kv)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body map[string]any
