@@ -73,11 +73,26 @@ func (s *Store) getLog(ctx context.Context, key string) ([]int, error) {
 
 // SetCommitOffsets sets the commit offsets for a given set of keys.
 func (s *Store) SetCommitOffsets(ctx context.Context, offsets map[string]int) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(offsets))
+
 	for key, offset := range offsets {
-		if err := s.SetCommitOffset(ctx, key, offset); err != nil {
-			return err
-		}
+		wg.Add(1)
+		go func(key string, offset int) {
+			defer wg.Done()
+			if err := s.SetCommitOffset(ctx, key, offset); err != nil {
+				errCh <- err
+			}
+		}(key, offset)
 	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		return err // return first error encountered
+	}
+
 	return nil
 }
 
