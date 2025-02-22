@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -114,14 +115,33 @@ func (s *Store) SetCommitOffset(ctx context.Context, key string, offset int) err
 
 // GetCommitOffsets returns the commit offsets for a given set of keys.
 func (s *Store) GetCommitOffsets(ctx context.Context, keys []string) (map[string]int, error) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
 	res := make(map[string]int)
+	errCh := make(chan error, len(keys))
+
 	for _, key := range keys {
-		offset, err := s.GetCommitOffset(ctx, key)
-		if err != nil {
-			return nil, err
-		}
-		res[key] = offset
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			offset, err := s.GetCommitOffset(ctx, key)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			mu.Lock()
+			res[key] = offset
+			mu.Unlock()
+		}(key)
 	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		return nil, err // return the first error encountered
+	}
+
 	return res, nil
 }
 
@@ -138,6 +158,8 @@ func (s *Store) GetCommitOffset(ctx context.Context, key string) (int, error) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
 	s := NewStore(kv)
