@@ -19,11 +19,10 @@ func NewStore(kv *maelstrom.KV) *Store {
 }
 
 // AddMessage appends a message to the log for a given key and returns the offset of the message.
-func (s *Store) AddMessage(key string, msg int) (int, error) {
-	ctx := context.Background()
+func (s *Store) AddMessage(ctx context.Context, key string, msg int) (int, error) {
 	kvkey := fmt.Sprintf("log/%s", key)
 	for {
-		currData, err := s.getLog(key)
+		currData, err := s.getLog(ctx, key)
 		if err != nil {
 			return 0, err
 		}
@@ -43,10 +42,10 @@ func (s *Store) AddMessage(key string, msg int) (int, error) {
 
 // Poll returns the messages for a given set of offsets.
 // Returns a map from keys to arrays of [offset, message] pairs.
-func (s *Store) Poll(offsets map[string]int) (map[string][][2]int, error) {
+func (s *Store) Poll(ctx context.Context, offsets map[string]int) (map[string][][2]int, error) {
 	res := make(map[string][][2]int)
 	for key, offset := range offsets {
-		data, err := s.getLog(key)
+		data, err := s.getLog(ctx, key)
 		if err != nil {
 			return nil, err
 		}
@@ -59,8 +58,7 @@ func (s *Store) Poll(offsets map[string]int) (map[string][][2]int, error) {
 }
 
 // getLog returns all of the messages of a log with the given key.
-func (s *Store) getLog(key string) ([]int, error) {
-	ctx := context.Background()
+func (s *Store) getLog(ctx context.Context, key string) ([]int, error) {
 	kvkey := fmt.Sprintf("log/%s", key)
 	var data []int
 	if err := s.kv.ReadInto(ctx, kvkey, &data); err != nil {
@@ -73,9 +71,9 @@ func (s *Store) getLog(key string) ([]int, error) {
 }
 
 // SetCommitOffsets sets the commit offsets for a given set of keys.
-func (s *Store) SetCommitOffsets(offsets map[string]int) error {
+func (s *Store) SetCommitOffsets(ctx context.Context, offsets map[string]int) error {
 	for key, offset := range offsets {
-		if err := s.SetCommitOffset(key, offset); err != nil {
+		if err := s.SetCommitOffset(ctx, key, offset); err != nil {
 			return err
 		}
 	}
@@ -84,8 +82,7 @@ func (s *Store) SetCommitOffsets(offsets map[string]int) error {
 
 // SetCommitOffset sets the commit offset for a given key.
 // Setting the offset for a key to a lower value than the current offset is a no-op.
-func (s *Store) SetCommitOffset(key string, offset int) error {
-	ctx := context.Background()
+func (s *Store) SetCommitOffset(ctx context.Context, key string, offset int) error {
 	kvkey := fmt.Sprintf("offset/%s", key)
 	for {
 		// get the current offset
@@ -116,10 +113,10 @@ func (s *Store) SetCommitOffset(key string, offset int) error {
 }
 
 // GetCommitOffsets returns the commit offsets for a given set of keys.
-func (s *Store) GetCommitOffsets(keys []string) (map[string]int, error) {
+func (s *Store) GetCommitOffsets(ctx context.Context, keys []string) (map[string]int, error) {
 	res := make(map[string]int)
 	for _, key := range keys {
-		offset, err := s.GetCommitOffset(key)
+		offset, err := s.GetCommitOffset(ctx, key)
 		if err != nil {
 			return nil, err
 		}
@@ -129,8 +126,7 @@ func (s *Store) GetCommitOffsets(keys []string) (map[string]int, error) {
 }
 
 // GetCommitOffset returns the commit offset for a given key.
-func (s *Store) GetCommitOffset(key string) (int, error) {
-	ctx := context.Background()
+func (s *Store) GetCommitOffset(ctx context.Context, key string) (int, error) {
 	offset, err := s.kv.ReadInt(ctx, fmt.Sprintf("offset/%s", key))
 	if err != nil {
 		if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
@@ -161,7 +157,7 @@ func main() {
 			return errors.New("msg is not a float64")
 		}
 
-		offset, err := s.AddMessage(key, int(mesg))
+		offset, err := s.AddMessage(context.Background(), key, int(mesg))
 		if err != nil {
 			return err
 		}
@@ -184,7 +180,7 @@ func main() {
 			offsets2[key] = int(offset.(float64))
 		}
 
-		messages, err := s.Poll(offsets2)
+		messages, err := s.Poll(context.Background(), offsets2)
 		if err != nil {
 			return err
 		}
@@ -207,7 +203,7 @@ func main() {
 			offsets2[key] = int(offset.(float64))
 		}
 
-		if err := s.SetCommitOffsets(offsets2); err != nil {
+		if err := s.SetCommitOffsets(context.Background(), offsets2); err != nil {
 			return err
 		}
 
@@ -229,7 +225,7 @@ func main() {
 			keys2 = append(keys2, key.(string))
 		}
 
-		offsets, err := s.GetCommitOffsets(keys2)
+		offsets, err := s.GetCommitOffsets(context.Background(), keys2)
 		if err != nil {
 			return err
 		}
