@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -13,32 +14,29 @@ import (
 
 type Store struct {
 	kv *maelstrom.KV
+	mu sync.Mutex
 }
 
 func NewStore(kv *maelstrom.KV) *Store {
-	return &Store{kv}
+	return &Store{kv: kv}
 }
 
 // AddMessage appends a message to the log for a given key and returns the offset of the message.
 func (s *Store) AddMessage(ctx context.Context, key string, msg int) (int, error) {
-	kvkey := fmt.Sprintf("log/%s", key)
-	for {
-		currData, err := s.getLog(ctx, key)
-		if err != nil {
-			return 0, err
-		}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-		// compare-and-swap to update the KV store
-		newData := append(currData, msg)
-		if err := s.kv.CompareAndSwap(ctx, kvkey, currData, newData, true); err != nil {
-			if rpcErr, ok := err.(*maelstrom.RPCError); ok && rpcErr.Code == maelstrom.PreconditionFailed {
-				// if the CAS fails, retry
-				continue
-			}
-			return 0, fmt.Errorf("kv error: %w", err)
-		}
-		return len(newData) - 1, nil
+	kvkey := fmt.Sprintf("log/%s", key)
+	currData, err := s.getLog(ctx, key)
+	if err != nil {
+		return 0, err
 	}
+
+	newData := append(currData, msg)
+	if err := s.kv.Write(ctx, kvkey, newData); err != nil {
+		return 0, fmt.Errorf("kv error: %w", err)
+	}
+	return len(newData) - 1, nil
 }
 
 // Poll returns the messages for a given set of offsets.
@@ -202,6 +200,7 @@ func main() {
 	s := NewStore(kv)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
+		ctx := context.Background()
 		var body map[string]any
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
@@ -216,12 +215,41 @@ func main() {
 			return errors.New("msg is not a float64")
 		}
 
-		offset, err := s.AddMessage(context.Background(), key, int(mesg))
+		keyInt, err := strconv.Atoi(key)
+		if err != nil {
+			return fmt.Errorf("key is not an integer: %w", err)
+		}
+
+		targetNode := n.NodeIDs()[keyInt%len(n.NodeIDs())]
+		if targetNode != n.ID() {
+			// forward the message to another node
+			msg2, err := n.SyncRPC(ctx, targetNode, msg.Body)
+			if err != nil {
+				return fmt.Errorf("failed to forward message: %w", err)
+			}
+
+			var body2 map[string]any
+			if err := json.Unmarshal(msg2.Body, &body2); err != nil {
+				return fmt.Errorf("failed to unmarshal message: %w", err)
+			}
+
+			if body2["type"] != "send_ok" {
+				return fmt.Errorf("unexpected message type: %s", body2["type"])
+			}
+
+			return n.Reply(msg, map[string]any{"type": "send_ok", "offset": body2["offset"]})
+		}
+
+		offset, err := s.AddMessage(ctx, key, int(mesg))
 		if err != nil {
 			return err
 		}
 
 		return n.Reply(msg, map[string]any{"type": "send_ok", "offset": offset})
+	})
+
+	n.Handle("send_ok", func(msg maelstrom.Message) error {
+		return nil
 	})
 
 	n.Handle("poll", func(msg maelstrom.Message) error {
