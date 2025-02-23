@@ -13,12 +13,14 @@ import (
 )
 
 type Store struct {
-	kv *maelstrom.KV
-	mu sync.Mutex
+	n    *maelstrom.Node
+	kv   *maelstrom.KV
+	mu   sync.Mutex
+	data map[string][]int // only this node's data is stored here
 }
 
-func NewStore(kv *maelstrom.KV) *Store {
-	return &Store{kv: kv}
+func NewStore(n *maelstrom.Node, kv *maelstrom.KV) *Store {
+	return &Store{n, kv, sync.Mutex{}, make(map[string][]int)}
 }
 
 // AddMessage appends a message to the log for a given key and returns the offset of the message.
@@ -27,12 +29,13 @@ func (s *Store) AddMessage(ctx context.Context, key string, msg int) (int, error
 	defer s.mu.Unlock()
 
 	kvkey := fmt.Sprintf("log/%s", key)
-	currData, err := s.getLog(ctx, key)
-	if err != nil {
-		return 0, err
+	currData, ok := s.data[key]
+	if !ok {
+		currData = make([]int, 0)
 	}
 
 	newData := append(currData, msg)
+	s.data[key] = newData
 	if err := s.kv.Write(ctx, kvkey, newData); err != nil {
 		return 0, fmt.Errorf("kv error: %w", err)
 	}
@@ -80,6 +83,15 @@ func (s *Store) Poll(ctx context.Context, offsets map[string]int) (map[string][]
 
 // getLog returns all of the messages of a log with the given key.
 func (s *Store) getLog(ctx context.Context, key string) ([]int, error) {
+	// if the key is on this node, return the data from the local store
+	keyInt := keyToInt(key)
+	targetNode := s.n.NodeIDs()[keyInt%len(s.n.NodeIDs())]
+	if targetNode == s.n.ID() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.data[key], nil
+	}
+
 	kvkey := fmt.Sprintf("log/%s", key)
 	var data []int
 	if err := s.kv.ReadInto(ctx, kvkey, &data); err != nil {
@@ -197,7 +209,7 @@ func main() {
 
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
-	s := NewStore(kv)
+	s := NewStore(n, kv)
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		ctx := context.Background()
@@ -215,10 +227,7 @@ func main() {
 			return errors.New("msg is not a float64")
 		}
 
-		keyInt, err := strconv.Atoi(key)
-		if err != nil {
-			return fmt.Errorf("key is not an integer: %w", err)
-		}
+		keyInt := keyToInt(key)
 
 		targetNode := n.NodeIDs()[keyInt%len(n.NodeIDs())]
 		if targetNode != n.ID() {
@@ -323,4 +332,12 @@ func main() {
 	if err := n.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func keyToInt(key string) int {
+	keyInt, err := strconv.Atoi(key)
+	if err != nil {
+		panic(fmt.Sprintf("key is not an integer: %s", key))
+	}
+	return keyInt
 }
